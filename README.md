@@ -17,7 +17,7 @@ Different libraries are used based on the file type to ensure maximum data quali
 - **`pdfplumber`**: For parsing native, machine-readable text and layout from standard PDFs.
 - **`pypdfium2`**: An ultra-fast PDF renderer used to turn PDF pages into images. This is triggered as a fallback when a PDF is scanned or image-only.
 - **`python-docx`**: For natively parsing Microsoft Word paragraphs and grouping them into synthetic "pages" for chunking.
-- **`langchain-text-splitters`**: Using `RecursiveCharacterTextSplitter` and `MarkdownTextSplitter` to semantically chunk documents without breaking sentences.
+- **Custom Semantic Chunking**: Using a bespoke `RecursiveCharacterTextSplitter` algorithm to dynamically chunk documents along semantic boundaries (paragraphs, lines) without breaking coherent sentences.
 
 ---
 
@@ -26,7 +26,7 @@ Different libraries are used based on the file type to ensure maximum data quali
 The core feature of this backend is Retrieval-Augmented Generation (RAG). Here is exactly how a document goes from an uploaded file to an intelligent answer:
 
 ### 1. Extraction & Ingestion
-When a file hits the `/upload` endpoint, it is saved to a temporary directory. The backend determines the correct parsing strategy based on the file extension:
+When a file hits the `/upload` endpoint, it is saved to a temporary directory. The endpoint returns a real-time **Server-Sent Events (SSE)** stream, yielding precise progress percentages and granular status messages ("Running OCR on image 2...") directly back to the frontend. The backend determines the correct parsing strategy based on the file extension:
 - **TXT**: Read directly as a single long page.
 - **DOCX**: `python-docx` extracts paragraphs sequentially. Because Word documents don't have hard "page" boundaries in the same way PDFs do, the backend groups paragraphs into ~3000-character synthetic pages so they can be referenced and cited easily. 
   - **Vision OCR Fallback**: If the DOCX contains no extractable text (e.g. image-only), the backend unzips the file, extracts the embedded media, and runs them through Gemini Vision OCR.
@@ -35,9 +35,9 @@ When a file hits the `/upload` endpoint, it is saved to a temporary directory. T
 
 ### 2. Semantic Chunking
 Once the text is extracted, it must be broken down into digestible pieces for the LLM to search against. 
-- The backend uses LangChain's `MarkdownTextSplitter` (which inherits from `RecursiveCharacterTextSplitter`).
-- Documents are chunked into **1000-character blocks** with a **200-character overlap**. 
-- The overlap ensures that if a sentence or thought crosses a chunk boundary, context isn't lost. 
+- The backend uses a custom-built `RecursiveCharacterTextSplitter`.
+- Documents are split based strictly on semantic boundaries (e.g. `\n\n` for paragraphs, `\n` for lines, `. ` for sentences).
+- Each semantic chunk respects a maximum limit of **800 characters** with a **150-character overlap**. This ensures short paragraphs remain small, precise chunks, while larger sections are kept intact up to the limit.
 - Crucially, every chunk retains metadata: `document_id`, `filename`, and the original `source_page_number`.
 
 ### 3. Vectorization & Storage
@@ -48,9 +48,9 @@ Once the text is extracted, it must be broken down into digestible pieces for th
 ### 4. Retrieval & Querying
 When a user asks a question via the `/chat` endpoint:
 - The user's query is converted into an embedding using the exact same Gemini embedding model.
-- The backend queries ChromaDB, performing a cosine similarity search to find the top 5 chunks that semantically match the user's question.
-- **Smart Grouping:** The backend groups these 5 chunks by their source page number. If multiple relevant chunks (paragraphs) come from the same page, they are merged into a single block. This ensures that the LLM cites the page once, and the frontend displays all relevant paragraphs for that page together without returning the entire unrelated page text.
-- These merged page contexts are injected into the `System Prompt` as exact reference material, alongside instructions demanding that the LLM cite its sources (e.g., `[1]`, `[2]`).
+- The backend queries ChromaDB, performing a cosine similarity search to find the **top 10 most relevant chunks** that semantically match the user's question.
+- **Strict Anti-Hallucination Grounding:** These highly-specific retrieved chunks are injected into a rigorous system prompt. The prompt acts as an expert financial analyst, explicitly forbidding the LLM from inventing data, demanding exact numeric quotations, and requiring it to clearly state if information is missing. 
+- The system instructions also demand that the LLM cite its sources (e.g., `[1]`, `[2]`) referencing the specific chunks provided.
 
 ### 5. Generation & Streaming
 - The constructed prompt is sent to `gemini-2.0-flash`.
