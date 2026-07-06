@@ -1,83 +1,69 @@
-# Document-Based AI Assistant (Backend)
+# Document AI Assistant - Backend
 
-This is the backend for the RAG-powered Document AI Assistant. It provides a robust, scalable, and fast API for ingesting documents (PDF, DOCX, TXT), extracting their content (including OCR for images), vectorizing them, and answering user queries using an LLM.
+## Overview
+This is the backend service for the Document AI Assistant. It is a production-ready Retrieval-Augmented Generation (RAG) system that processes user documents, performs semantic chunking, and provides an intelligent conversational interface using Google Gemini.
 
-## Tech Stack Overview
+## Technology Stack
+- **Framework**: FastAPI (Python)
+- **Vector Database**: ChromaDB (for fast semantic search)
+- **AI Models**: Google Gemini 2.0 Flash (LLM & Vision OCR), Gemini Text Embedding
+- **Data Streaming**: Server-Sent Events (SSE) for real-time progress
+- **Document Parsers**: `pdfplumber` (PDFs), `pypdfium2` (Image/Scanned PDFs), `python-docx` (Word files)
 
-- **Core Framework**: [FastAPI](https://fastapi.tiangolo.com/) for high-performance, asynchronous endpoints.
-- **Vector Database**: [ChromaDB](https://www.trychroma.com/) for storing document embeddings and performing lightning-fast similarity (RAG) searches.
-- **LLM & Embeddings**: Google Gemini API
-  - `models/gemini-embedding-001` to generate vector embeddings.
-  - `gemini-2.0-flash` for reasoning, answering questions, and performing Vision OCR on scanned documents.
-- **Streaming**: `sse-starlette` to stream tokens back to the frontend in real-time via Server-Sent Events (SSE).
-- **Security & Limiting**: `slowapi` to prevent abuse via IP-based rate limiting.
+## System Architecture
 
-### Document Extraction Libraries
-Different libraries are used based on the file type to ensure maximum data quality:
-- **`pdfplumber`**: For parsing native, machine-readable text and layout from standard PDFs.
-- **`pypdfium2`**: An ultra-fast PDF renderer used to turn PDF pages into images. This is triggered as a fallback when a PDF is scanned or image-only.
-- **`python-docx`**: For natively parsing Microsoft Word paragraphs and grouping them into synthetic "pages" for chunking.
-- **Custom Semantic Chunking**: Using a bespoke `RecursiveCharacterTextSplitter` algorithm to dynamically chunk documents along semantic boundaries (paragraphs, lines) without breaking coherent sentences.
-
----
-
-## How Chunking & Retrieval Works (RAG Pipeline)
-
-The core feature of this backend is Retrieval-Augmented Generation (RAG). Here is exactly how a document goes from an uploaded file to an intelligent answer:
-
-### 1. Extraction & Ingestion
-When a file hits the `/upload` endpoint, it is saved to a temporary directory. The endpoint returns a real-time **Server-Sent Events (SSE)** stream, yielding precise progress percentages and granular status messages ("Running OCR on image 2...") directly back to the frontend. The backend determines the correct parsing strategy based on the file extension:
-- **TXT**: Read directly as a single long page.
-- **DOCX**: `python-docx` extracts paragraphs sequentially. Because Word documents don't have hard "page" boundaries in the same way PDFs do, the backend groups paragraphs into ~3000-character synthetic pages so they can be referenced and cited easily. 
-  - **Vision OCR Fallback**: If the DOCX contains no extractable text (e.g. image-only), the backend unzips the file, extracts the embedded media, and runs them through Gemini Vision OCR.
-- **PDF**: Processed page-by-page via `pdfplumber`. 
-  - **Vision OCR Fallback**: If a page yields fewer than 30 characters, the backend assumes it is a scanned document or image. It invokes `pypdfium2` to render the page at 2x resolution, passes that image to `gemini-2.0-flash`, and uses the Vision API to perfectly transcribe the text structure.
-
-### 2. Semantic Chunking
-Once the text is extracted, it must be broken down into digestible pieces for the LLM to search against. 
-- The backend uses a custom-built `RecursiveCharacterTextSplitter`.
-- Documents are split based strictly on semantic boundaries (e.g. `\n\n` for paragraphs, `\n` for lines, `. ` for sentences).
-- Each semantic chunk respects a maximum limit of **800 characters** with a **150-character overlap**. This ensures short paragraphs remain small, precise chunks, while larger sections are kept intact up to the limit.
-- Crucially, every chunk retains metadata: `document_id`, `filename`, and the original `source_page_number`.
-
-### 3. Vectorization & Storage
-- Each chunk is passed to `get_embeddings` which calls the `models/gemini-embedding-001` API.
-- The text chunk, its embedding vector, and its metadata are stored in **ChromaDB**. 
-- By default, Chroma runs ephemerally in-memory, but can be configured to connect to a cloud tenant via the `.env` file.
-
-### 4. Retrieval & Querying
-When a user asks a question via the `/chat` endpoint:
-- The user's query is converted into an embedding using the exact same Gemini embedding model.
-- The backend queries ChromaDB, performing a cosine similarity search to find the **top 10 most relevant chunks** that semantically match the user's question.
-- **Strict Anti-Hallucination Grounding:** These highly-specific retrieved chunks are injected into a rigorous system prompt. The prompt acts as an expert financial analyst, explicitly forbidding the LLM from inventing data, demanding exact numeric quotations, and requiring it to clearly state if information is missing. 
-- The system instructions also demand that the LLM cite its sources (e.g., `[1]`, `[2]`) referencing the specific chunks provided.
-
-### 5. Generation & Streaming
-- The constructed prompt is sent to `gemini-2.0-flash`.
-- As the model generates the answer, `sse-starlette` captures the output and streams it back to the client token-by-token over an HTTP connection.
-- After the text finishes generating, a final JSON payload containing the exact citations (including the original chunk text and page numbers) is sent so the frontend can display clickable source panels.
-
-### 6. Dynamic Suggested Questions
-The backend also features a `POST /chat/suggestions` endpoint. When a document is uploaded, the frontend hits this endpoint. The backend retrieves the first few chunks from ChromaDB, passes them to the LLM with a highly specific prompt, and parses the response to generate 4 dynamic, document-aware questions for the user's empty state UI.
-
----
-
-## Environment Setup
-
-Copy `.env.example` to `.env` and fill in your variables:
-
-```ini
-GEMINI_API_KEY="your-api-key"
-ALLOWED_ORIGINS="http://localhost:3000,http://192.168.56.1:3000"
+```mermaid
+graph TD
+    A[Client Uploads File] --> B[FastAPI /upload]
+    B --> C{File Type?}
+    C -->|Text PDF| D[pdfplumber Extraction]
+    C -->|Scanned PDF| E[Gemini Vision OCR]
+    C -->|DOCX| F[python-docx Extraction]
+    
+    D & E & F --> G[Semantic Chunking]
+    G --> H[Generate Embeddings]
+    H --> I[(ChromaDB Vector Store)]
+    
+    J[Client Asks Question] --> K[FastAPI /chat]
+    K --> L[Search ChromaDB]
+    L --> M[Inject Context into Prompt]
+    M --> N[Gemini LLM]
+    N --> O[Stream Answer & Citations via SSE]
 ```
 
-### Running Locally
+## How the Process Works
+1. **Document Ingestion**: When a user uploads a file, the system determines the optimal parsing strategy. If it detects a scanned document or image, it automatically applies Optical Character Recognition (OCR) to accurately extract the layout and text.
+2. **Semantic Chunking**: The extracted text is divided into coherent paragraphs (bounded to 800 characters) rather than arbitrary slices. This ensures that the system retains the precise meaning of each sentence.
+3. **Vector Storage**: Each semantic chunk is converted into a mathematical vector (embedding) and stored in ChromaDB.
+4. **Intelligent Retrieval**: When a question is asked, the system retrieves the most relevant chunks. It strictly instructs the AI to only utilize these specific paragraphs, effectively mitigating hallucinations and ensuring exact source citations.
 
+## API Endpoints
+The backend exposes three primary REST endpoints:
+1. `GET /health` : Verifies server status. It is also used by the internal Keep-Alive thread to prevent the server from spinning down on platforms like Render.
+2. `POST /upload` : Accepts multipart document files (PDF, DOCX, TXT). It streams real-time parsing and embedding progress back to the client using Server-Sent Events (SSE).
+3. `POST /chat` : Accepts user queries. It streams the AI's response token-by-token and concludes by sending the exact source paragraphs (citations) utilized.
+
+## Environment Configuration
+Create a `.env` file in the root directory:
+```ini
+# Required: Google Gemini API Key
+GEMINI_API_KEY="your-api-key-here"
+
+# Required: Allowed CORS Origins (e.g., Vercel URL or localhost)
+ALLOWED_ORIGINS="http://localhost:3000,https://your-frontend-url.vercel.app"
+
+# Optional: Advanced Database Configurations
+GROQ_API_KEY=""
+CHROMA_TENANT=""
+CHROMA_DATABASE=""
+
+# Server Port
+PORT=8000
+```
+
+## Running the Server
+Ensure you are using Python 3.11+.
 ```bash
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate # Mac/Linux
-
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
