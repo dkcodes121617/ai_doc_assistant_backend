@@ -28,7 +28,8 @@ The core feature of this backend is Retrieval-Augmented Generation (RAG). Here i
 ### 1. Extraction & Ingestion
 When a file hits the `/upload` endpoint, it is saved to a temporary directory. The backend determines the correct parsing strategy based on the file extension:
 - **TXT**: Read directly as a single long page.
-- **DOCX**: `python-docx` extracts paragraphs sequentially. Because Word documents don't have hard "page" boundaries in the same way PDFs do, the backend groups paragraphs into ~3000-character synthetic pages so they can be referenced and cited easily.
+- **DOCX**: `python-docx` extracts paragraphs sequentially. Because Word documents don't have hard "page" boundaries in the same way PDFs do, the backend groups paragraphs into ~3000-character synthetic pages so they can be referenced and cited easily. 
+  - **Vision OCR Fallback**: If the DOCX contains no extractable text (e.g. image-only), the backend unzips the file, extracts the embedded media, and runs them through Gemini Vision OCR.
 - **PDF**: Processed page-by-page via `pdfplumber`. 
   - **Vision OCR Fallback**: If a page yields fewer than 30 characters, the backend assumes it is a scanned document or image. It invokes `pypdfium2` to render the page at 2x resolution, passes that image to `gemini-2.0-flash`, and uses the Vision API to perfectly transcribe the text structure.
 
@@ -48,12 +49,16 @@ Once the text is extracted, it must be broken down into digestible pieces for th
 When a user asks a question via the `/chat` endpoint:
 - The user's query is converted into an embedding using the exact same Gemini embedding model.
 - The backend queries ChromaDB, performing a cosine similarity search to find the top 5 chunks that semantically match the user's question.
-- The backend extracts these 5 chunks and injects them into the `System Prompt` as exact reference material, alongside instructions demanding that the LLM cite its sources (e.g., `[1]`, `[2]`).
+- **Smart Grouping:** The backend groups these 5 chunks by their source page number. If multiple relevant chunks (paragraphs) come from the same page, they are merged into a single block. This ensures that the LLM cites the page once, and the frontend displays all relevant paragraphs for that page together without returning the entire unrelated page text.
+- These merged page contexts are injected into the `System Prompt` as exact reference material, alongside instructions demanding that the LLM cite its sources (e.g., `[1]`, `[2]`).
 
 ### 5. Generation & Streaming
 - The constructed prompt is sent to `gemini-2.0-flash`.
 - As the model generates the answer, `sse-starlette` captures the output and streams it back to the client token-by-token over an HTTP connection.
 - After the text finishes generating, a final JSON payload containing the exact citations (including the original chunk text and page numbers) is sent so the frontend can display clickable source panels.
+
+### 6. Dynamic Suggested Questions
+The backend also features a `POST /chat/suggestions` endpoint. When a document is uploaded, the frontend hits this endpoint. The backend retrieves the first few chunks from ChromaDB, passes them to the LLM with a highly specific prompt, and parses the response to generate 4 dynamic, document-aware questions for the user's empty state UI.
 
 ---
 

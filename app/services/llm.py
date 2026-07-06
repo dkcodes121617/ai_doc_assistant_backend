@@ -3,6 +3,13 @@ from google.genai import types
 from groq import Groq
 from app.core.config import settings
 
+def generate_text(system_prompt: str, user_prompt: str) -> str:
+    """Helper to get a full string response without streaming."""
+    result = []
+    for chunk in call_llm(system_prompt, user_prompt):
+        result.append(chunk)
+    return "".join(result)
+
 def call_llm(system_prompt: str, user_prompt: str):
     use_groq = False
     

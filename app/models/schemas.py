@@ -11,6 +11,9 @@ class ChatRequest(BaseModel):
     document_ids: List[str] = Field(..., min_length=1)
     query: str = Field(..., min_length=1, max_length=1000)
 
+class SuggestionRequest(BaseModel):
+    document_ids: List[str] = Field(..., min_length=1)
+
 class Citation(BaseModel):
     chunk_id: str
     page_number: int
