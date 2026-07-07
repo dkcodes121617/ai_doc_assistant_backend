@@ -1,6 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, Request, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from starlette.concurrency import iterate_in_threadpool
+import asyncio
+import time
 import uuid
 import json
 import logging
@@ -83,21 +85,31 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 return
 
             yield {"data": json.dumps({"type": "progress", "status": "Chunking document text...", "percent": 50})}
+            t = time.perf_counter()
             final_chunks = await run_in_threadpool(process_document_chunks, pages_data, document_id, filename)
+            logger.info("Chunked '%s' into %d chunks in %.2fs", filename, len(final_chunks), time.perf_counter() - t)
 
             texts = [c["text"] for c in final_chunks]
             total_chunks = len(texts)
             embeddings = []
             batch_size = 50
+            t = time.perf_counter()
             for i in range(0, total_chunks, batch_size):
                 pct = int(50 + (i / total_chunks) * 35)
                 yield {"data": json.dumps({"type": "progress", "status": f"Generating embeddings ({min(i + batch_size, total_chunks)}/{total_chunks})...", "percent": pct})}
                 batch = texts[i:i + batch_size]
                 batch_emb = await run_in_threadpool(get_embeddings, batch, "RETRIEVAL_DOCUMENT")
                 embeddings.extend(batch_emb)
+            logger.info("Embedded %d chunks in %.2fs", total_chunks, time.perf_counter() - t)
 
             yield {"data": json.dumps({"type": "progress", "status": "Saving to vector database...", "percent": 90})}
-            await run_in_threadpool(add_chunks_to_chroma, final_chunks, embeddings)
+            t = time.perf_counter()
+            # Guard against a hung/slow Chroma write so the user isn't stuck forever.
+            await asyncio.wait_for(
+                run_in_threadpool(add_chunks_to_chroma, final_chunks, embeddings),
+                timeout=90,
+            )
+            logger.info("Saved %d chunks to Chroma in %.2fs", len(final_chunks), time.perf_counter() - t)
 
             yield {"data": json.dumps({
                 "type": "success", 
@@ -108,6 +120,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                     "num_pages": len(pages_data)
                 }
             })}
+        except asyncio.TimeoutError:
+            logger.error("[Upload] Vector DB save timed out for '%s'", filename)
+            yield {"data": json.dumps({"type": "error", "message": "Saving to the vector database is taking too long — it may be slow or unreachable right now. Please try again."})}
         except Exception as e:
             logger.error("[Upload] Processing failed: %s", e)
             yield {"data": json.dumps({"type": "error", "message": friendly_error_message(e, context="upload")})}
