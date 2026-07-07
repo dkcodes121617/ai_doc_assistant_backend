@@ -66,8 +66,9 @@ The system is built to degrade gracefully instead of failing outright:
 
 ## Performance Notes
 - All blocking work (embeddings, database, OCR, LLM streaming) runs in a worker thread pool, so one user's request never freezes the server for everyone else.
-- SDK clients (Gemini, Groq, Chroma) are created once and reused, avoiding per-request setup latency.
-- Network calls have 60-second timeouts so a hung upstream can't hang a request forever.
+- SDK clients (Gemini, Groq, Chroma) are created once and reused (guarded by a reentrant lock), avoiding per-request setup latency.
+- Network calls have 60-second timeouts, and the vector-database write has its own 90-second guard, so a hung upstream can't freeze a request forever — the user gets a clear error instead.
+- We pass our own Gemini embeddings to Chroma and disable its built-in embedding model (`embedding_function=None`). This avoids an ~80MB model download on first use, which otherwise stalls on hosts with a cold or ephemeral filesystem (e.g. Render's free tier).
 
 ## API Endpoints
 1. `GET /health` — server status; also used by the keep-alive thread.
