@@ -1,7 +1,10 @@
 from fastapi import APIRouter, UploadFile, File, Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from starlette.concurrency import iterate_in_threadpool
 import uuid
-import magic
 import json
+import logging
+import filetype
 from sse_starlette.sse import EventSourceResponse
 
 from app.core.security import limiter
@@ -9,18 +12,13 @@ from app.services.extraction import extract_text_from_pdf, extract_text_from_txt
 from app.services.chunking import process_document_chunks
 from app.services.embeddings import get_embeddings
 from app.services.vector_store import add_chunks_to_chroma
+from app.core.errors import friendly_error_message
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
-ALLOWED_MIME_TYPES = {
-    "application/pdf",
-    "text/plain",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/zip",
-    "application/octet-stream",
-}
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -31,20 +29,30 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large. Max 10 MB allowed.")
 
-    mime_type = magic.from_buffer(file_bytes, mime=True)
-    
+    # Detect type from magic bytes (pure-Python, no system libmagic needed).
+    kind = filetype.guess(file_bytes)
+    mime_type = kind.mime if kind else None
+
     filename_lower = (file.filename or "").lower()
+    is_pdf = mime_type == "application/pdf"
     is_docx = (
         mime_type == DOCX_MIME
-        or (mime_type in ("application/zip", "application/octet-stream") and filename_lower.endswith(".docx"))
+        or (mime_type in ("application/zip", "application/octet-stream", None) and filename_lower.endswith(".docx"))
     )
-    is_pdf = mime_type == "application/pdf"
-    is_txt = mime_type == "text/plain"
+    # filetype cannot sniff plain text (it has no magic-byte signature),
+    # so fall back to the .txt extension plus a UTF-8 decodability check.
+    is_txt = False
+    if not is_pdf and not is_docx and filename_lower.endswith(".txt"):
+        try:
+            file_bytes.decode("utf-8")
+            is_txt = True
+        except UnicodeDecodeError:
+            is_txt = False
 
     if not (is_pdf or is_txt or is_docx):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type ({mime_type}). Only PDF, DOCX, and TXT are allowed."
+            detail=f"Unsupported file type ({mime_type or 'unknown'}). Only PDF, DOCX, and TXT are allowed."
         )
 
     filename = file.filename or "unknown_file"
@@ -61,19 +69,21 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             else:
                 extractor = extract_text_from_txt(file_bytes)
 
+            # extractor is a blocking generator (pdfplumber / OCR) — pump it
+            # from a worker thread so the event loop stays responsive.
             pages_data = []
-            for item in extractor:
+            async for item in iterate_in_threadpool(extractor):
                 if item["type"] == "progress":
                     yield {"data": json.dumps(item)}
                 elif item["type"] == "result":
                     pages_data = item["data"]
 
             if not pages_data:
-                yield {"data": json.dumps({"type": "error", "message": "Could not extract any text from the document. Please ensure it is not an empty or image-only file without readable text."})}
+                yield {"data": json.dumps({"type": "error", "message": "We couldn't read any text from this document. It may be empty, or an image-only/scanned file our OCR couldn't process. Please try a clearer or text-based document."})}
                 return
 
             yield {"data": json.dumps({"type": "progress", "status": "Chunking document text...", "percent": 50})}
-            final_chunks = process_document_chunks(pages_data, document_id, filename)
+            final_chunks = await run_in_threadpool(process_document_chunks, pages_data, document_id, filename)
 
             texts = [c["text"] for c in final_chunks]
             total_chunks = len(texts)
@@ -83,11 +93,11 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 pct = int(50 + (i / total_chunks) * 35)
                 yield {"data": json.dumps({"type": "progress", "status": f"Generating embeddings ({min(i + batch_size, total_chunks)}/{total_chunks})...", "percent": pct})}
                 batch = texts[i:i + batch_size]
-                batch_emb = get_embeddings(batch, task_type="RETRIEVAL_DOCUMENT")
+                batch_emb = await run_in_threadpool(get_embeddings, batch, "RETRIEVAL_DOCUMENT")
                 embeddings.extend(batch_emb)
 
             yield {"data": json.dumps({"type": "progress", "status": "Saving to vector database...", "percent": 90})}
-            add_chunks_to_chroma(final_chunks, embeddings)
+            await run_in_threadpool(add_chunks_to_chroma, final_chunks, embeddings)
 
             yield {"data": json.dumps({
                 "type": "success", 
@@ -99,6 +109,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 }
             })}
         except Exception as e:
-            yield {"data": json.dumps({"type": "error", "message": str(e)})}
+            logger.error("[Upload] Processing failed: %s", e)
+            yield {"data": json.dumps({"type": "error", "message": friendly_error_message(e, context="upload")})}
 
     return EventSourceResponse(event_generator())

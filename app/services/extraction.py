@@ -1,13 +1,16 @@
 import io
 import base64
+import logging
 import zipfile
 import pdfplumber
 import pypdfium2 as pdfium
 from PIL import Image
 import docx
-from google import genai
 from google.genai import types
-from app.core.config import settings
+from app.core.clients import get_genai_client
+from app.core.errors import is_quota_error
+
+logger = logging.getLogger(__name__)
 
 # Minimum characters on a page to consider text-based (below = image-only)
 _MIN_TEXT_CHARS = 30
@@ -29,7 +32,7 @@ def _ocr_page_with_gemini(pdf_bytes: bytes, page_index: int, page_num: int) -> s
     """Send a rendered PDF page image to Gemini Vision and return extracted text."""
     try:
         b64 = _page_to_base64_png(pdf_bytes, page_index)
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        client = get_genai_client()
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
@@ -47,7 +50,10 @@ def _ocr_page_with_gemini(pdf_bytes: bytes, page_index: int, page_num: int) -> s
         )
         return (response.text or "").strip()
     except Exception as e:
-        print(f"[OCR] Gemini Vision failed for page {page_num}: {e}")
+        logger.warning("[OCR] Gemini Vision failed for page %s: %s", page_num, e)
+        # Out-of-credits / rate-limit should surface to the user, not be swallowed.
+        if is_quota_error(e):
+            raise
         return ""
 
 
@@ -64,7 +70,7 @@ def extract_text_from_pdf(file_bytes: bytes):
             if len(text) < _MIN_TEXT_CHARS:
                 # Image-only or scanned page — use Gemini Vision OCR
                 yield {"type": "progress", "status": f"Detected image on page {i + 1}, running Vision OCR...", "percent": int(5 + (i/total)*40)}
-                print(f"[OCR] Page {i + 1} has <{_MIN_TEXT_CHARS} chars, using Vision OCR…")
+                logger.info("[OCR] Page %s has <%s chars, using Vision OCR", i + 1, _MIN_TEXT_CHARS)
                 text = _ocr_page_with_gemini(file_bytes, i, i + 1)
             else:
                 yield {"type": "progress", "status": f"Extracting text from page {i + 1} of {total}...", "percent": int(5 + (i/total)*40)}
@@ -122,7 +128,7 @@ def extract_text_from_docx(file_bytes: bytes):
         try:
             with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
                 image_texts = []
-                client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                client = get_genai_client()
                 media_files = [n for n in z.namelist() if n.startswith("word/media/") and n.lower().endswith((".png", ".jpg", ".jpeg"))]
                 total_imgs = len(media_files)
                 for i, name in enumerate(media_files):
@@ -140,13 +146,18 @@ def extract_text_from_docx(file_bytes: bytes):
                         if response.text:
                             image_texts.append(response.text.strip())
                     except Exception as e:
-                        raise Exception(f"Vision OCR failed on embedded image: {e}")
+                        if is_quota_error(e):
+                            raise
+                        logger.warning("Vision OCR failed on embedded image: %s", e)
                 if image_texts:
                     pages_data.append({
                         "page_number": 1,
                         "text": "\n\n".join(image_texts)
                     })
         except Exception as e:
-            print(f"Failed to process DOCX images: {e}")
+            # Let credit/rate-limit errors bubble up; swallow benign parse issues.
+            if is_quota_error(e):
+                raise
+            logger.warning("Failed to process DOCX images: %s", e)
 
     yield {"type": "result", "data": pages_data}

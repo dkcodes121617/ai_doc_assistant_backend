@@ -1,4 +1,5 @@
 import os
+import logging
 import threading
 import time
 import urllib.request
@@ -13,23 +14,29 @@ from app.core.security import limiter
 from app.core.config import settings
 from app.routers import upload, chat, health
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("app")
+
 def ping_loop():
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
-        print("[KeepAlive] RENDER_EXTERNAL_URL not set. Skipping self-ping (only needed on Render).")
+        logger.info("[KeepAlive] RENDER_EXTERNAL_URL not set. Skipping self-ping (only needed on Render).")
         return
-    
+
     url = url.rstrip("/") + "/health"
-    print(f"[KeepAlive] Starting self-ping to {url} every 10 minutes.")
-    
+    logger.info("[KeepAlive] Starting self-ping to %s every 10 minutes.", url)
+
     while True:
         time.sleep(600)
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Render-KeepAlive'})
             with urllib.request.urlopen(req, timeout=10) as response:
-                print(f"[KeepAlive] Self-ping successful: {response.getcode()}")
+                logger.info("[KeepAlive] Self-ping successful: %s", response.getcode())
         except Exception as e:
-            print(f"[KeepAlive] Self-ping failed: {e}")
+            logger.warning("[KeepAlive] Self-ping failed: %s", e)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

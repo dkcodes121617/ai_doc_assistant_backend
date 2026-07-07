@@ -1,26 +1,62 @@
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from starlette.concurrency import iterate_in_threadpool
 from sse_starlette.sse import EventSourceResponse
 import json
-import re
+import logging
 
 from app.core.security import limiter
 from app.models.schemas import ChatRequest, SuggestionRequest
 from app.services.embeddings import get_embeddings
-from app.services.vector_store import query_chroma, get_chroma_client
+from app.services.vector_store import query_chroma, get_collection
 from app.services.llm import call_llm, generate_text
+from app.core.errors import friendly_error_message
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# Retrieval tuning: pull a wider set, then keep only the clearly-relevant ones.
+RETRIEVE_K = 8          # candidates fetched from the vector store
+MAX_CONTEXT_CHUNKS = 6  # hard cap on chunks sent to the LLM
+MIN_CONTEXT_CHUNKS = 3  # always keep at least this many (if available)
+RELATIVE_DISTANCE_CUTOFF = 1.6  # drop chunks farther than best_distance * this
+
+
+def _filter_relevant(chunks: list[dict]) -> list[dict]:
+    """Keep the strongest matches: always the top MIN_CONTEXT_CHUNKS, plus any
+    others within a relative distance of the best match, capped at MAX. This is
+    metric-agnostic (works whatever Chroma's distance space is) and can only
+    trim clearly-worse tail chunks — it never drops the best result."""
+    if not chunks:
+        return []
+    distances = [c.get("distance") for c in chunks]
+    if any(d is None for d in distances):
+        return chunks[:MAX_CONTEXT_CHUNKS]
+
+    best = distances[0] if distances[0] and distances[0] > 0 else None
+    kept = []
+    for i, chunk in enumerate(chunks):
+        if i < MIN_CONTEXT_CHUNKS:
+            kept.append(chunk)
+        elif best is not None and chunk["distance"] <= best * RELATIVE_DISTANCE_CUTOFF:
+            kept.append(chunk)
+        else:
+            break
+        if len(kept) >= MAX_CONTEXT_CHUNKS:
+            break
+    return kept
 
 @router.post("/suggestions")
 @limiter.limit("10/minute")
 async def suggestions(request: Request, body: SuggestionRequest):
     defaults = ["Summarise the key points", "What are the main conclusions?", "List all definitions", "What data or statistics are cited?"]
-    client = get_chroma_client()
     try:
-        collection = client.get_collection(name="rag_collection")
-        results = collection.get(
+        collection = get_collection()
+        results = await run_in_threadpool(
+            collection.get,
             where={"document_id": {"$in": body.document_ids}},
-            limit=4
+            limit=4,
         )
     except Exception:
         results = None
@@ -33,16 +69,15 @@ async def suggestions(request: Request, body: SuggestionRequest):
     user_prompt = f"Based on this document snippet, generate exactly 4 short, specific questions (max 8 words each) a user could ask. Return ONLY a valid JSON array of strings containing the questions. Do not include markdown code blocks like ```json.\n\nContext:\n{context}"
     
     try:
-        response_text = generate_text(system_prompt, user_prompt)
+        response_text = await run_in_threadpool(generate_text, system_prompt, user_prompt)
         # Clean potential markdown from LLM
         clean_json = response_text.strip().removeprefix("```json").removesuffix("```").strip()
         questions = json.loads(clean_json)
         if isinstance(questions, list) and len(questions) > 0:
             return {"questions": questions[:4]}
     except Exception as e:
-        print("Failed to generate suggestions", e)
-        pass
-        
+        logger.warning("Failed to generate suggestions: %s", e)
+
     return {"questions": defaults}
 
 
@@ -52,14 +87,17 @@ async def chat(request: Request, body: ChatRequest):
     document_ids = body.document_ids
     query = body.query
 
-    # 1. Embed the query
+    # 1. Embed the query (blocking network call → run off the event loop)
     try:
-        query_embedding = get_embeddings([query], task_type="RETRIEVAL_QUERY")[0]
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to embed query.")
+        embeddings = await run_in_threadpool(get_embeddings, [query], "RETRIEVAL_QUERY")
+        query_embedding = embeddings[0]
+    except Exception as e:
+        logger.error("Failed to embed query: %s", e)
+        raise HTTPException(status_code=500, detail=friendly_error_message(e, context="chat"))
 
-    # 2. Retrieve top-k chunks (increased to 10 for better recall on complex/financial docs)
-    chunks = query_chroma(query_embedding, document_ids, n_results=10)
+    # 2. Retrieve candidates, then keep only the clearly-relevant ones
+    chunks = await run_in_threadpool(query_chroma, query_embedding, document_ids, RETRIEVE_K)
+    chunks = _filter_relevant(chunks)
 
     # 3. Use retrieved chunks directly as separate citations (no page grouping)
     # This allows multiple distinct citations pointing to different specific paragraphs on the same page.
@@ -111,11 +149,16 @@ async def chat(request: Request, body: ChatRequest):
             "index": i,
         })
 
-    # 5. Stream LLM response then send citations
+    # 5. Stream LLM response then send citations.
+    # call_llm is a blocking generator; iterate_in_threadpool pumps it from a
+    # worker thread so the event loop stays free for other requests.
     async def sse_generator():
-        for text_chunk in call_llm(system_prompt, query):
-            yield {"data": json.dumps({"type": "text", "content": text_chunk})}
-
-        yield {"data": json.dumps({"type": "citations", "citations": citations})}
+        try:
+            async for text_chunk in iterate_in_threadpool(call_llm(system_prompt, query)):
+                yield {"data": json.dumps({"type": "text", "content": text_chunk})}
+            yield {"data": json.dumps({"type": "citations", "citations": citations})}
+        except Exception as e:
+            logger.error("Chat streaming failed: %s", e)
+            yield {"data": json.dumps({"type": "error", "message": friendly_error_message(e, context="chat")})}
 
     return EventSourceResponse(sse_generator())

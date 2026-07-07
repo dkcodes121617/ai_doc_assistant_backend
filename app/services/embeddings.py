@@ -1,7 +1,10 @@
-from google import genai
 from google.genai import types
-from app.core.config import settings
 
+from app.core.clients import get_genai_client
+from app.core.retry import with_retry
+
+
+@with_retry
 def get_embeddings(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
     """Get embeddings for a list of texts.
     Use task_type='RETRIEVAL_QUERY' for search queries,
@@ -9,9 +12,9 @@ def get_embeddings(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> l
     """
     if not texts:
         return []
-    
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    
+
+    client = get_genai_client()
+
     response = client.models.embed_content(
         model='models/gemini-embedding-001',
         contents=texts,
@@ -19,8 +22,5 @@ def get_embeddings(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> l
             task_type=task_type
         )
     )
-    
-    embeddings = []
-    for emb in response.embeddings:
-        embeddings.append(emb.values)
-    return embeddings
+
+    return [emb.values for emb in response.embeddings]

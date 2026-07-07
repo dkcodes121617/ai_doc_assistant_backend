@@ -1,7 +1,11 @@
-from google import genai
+import logging
+
 from google.genai import types
-from groq import Groq
-from app.core.config import settings
+
+from app.core.clients import get_genai_client, get_groq_client
+
+logger = logging.getLogger(__name__)
+
 
 def generate_text(system_prompt: str, user_prompt: str) -> str:
     """Helper to get a full string response without streaming."""
@@ -11,10 +15,14 @@ def generate_text(system_prompt: str, user_prompt: str) -> str:
     return "".join(result)
 
 def call_llm(system_prompt: str, user_prompt: str):
-    use_groq = False
-    
+    """Stream from Gemini, falling back to Groq only if Gemini fails before
+    emitting anything. Raises on total failure so callers can surface a clean
+    message (avoids streaming a partial answer then duplicating it with Groq)."""
+    emitted = False
+
+    # --- Primary: Gemini ---
     try:
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        client = get_genai_client()
         response = client.models.generate_content_stream(
             model='gemini-2.5-flash',
             contents=user_prompt,
@@ -22,33 +30,35 @@ def call_llm(system_prompt: str, user_prompt: str):
                 system_instruction=system_prompt,
             )
         )
-        iterator = iter(response)
-        first_chunk = next(iterator)
-        if first_chunk.text:
-            yield first_chunk.text
-        for chunk in iterator:
+        for chunk in response:
             if chunk.text:
+                emitted = True
                 yield chunk.text
+        return  # completed successfully
     except Exception as e:
-        print(f"Gemini failed, falling back to Groq: {e}")
-        use_groq = True
-        
-    if use_groq:
-        try:
-            groq_client = Groq(api_key=settings.GROQ_API_KEY)
-            stream = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                model="llama3-8b-8192",
-                stream=True
-            )
-            
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
-        except Exception as e:
-            print(f"Groq fallback failed: {e}")
-            yield f"\n\n[Error: Both primary (Gemini) and fallback (Groq) LLMs failed to respond. Details: {e}]"
+        # Copy out of the except target (Python unbinds it after the block).
+        gemini_error = e
+        logger.warning("Gemini failed: %s", gemini_error)
+        if emitted:
+            # Partial answer already streamed — do not re-run Groq (would duplicate).
+            raise RuntimeError(f"LLM stream interrupted: {gemini_error}")
+
+    # --- Fallback: Groq (only reached if Gemini emitted nothing) ---
+    try:
+        groq_client = get_groq_client()
+        stream = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            stream=True
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as groq_error:
+        logger.error("Groq fallback failed: %s", groq_error)
+        # Preserve the original error text so quota/credit markers survive.
+        raise RuntimeError(f"All AI providers failed: {gemini_error}; {groq_error}")
