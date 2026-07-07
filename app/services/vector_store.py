@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 
 import chromadb
 
@@ -25,11 +26,14 @@ def get_chroma_client():
                     logger.warning("CHROMA_TENANT not set — using in-memory EphemeralClient (data will not persist).")
                     _client = chromadb.EphemeralClient()
                 else:
+                    logger.info("Connecting to Chroma Cloud (db=%s)...", settings.CHROMA_DATABASE)
+                    t = time.perf_counter()
                     _client = chromadb.CloudClient(
                         tenant=settings.CHROMA_TENANT,
                         database=settings.CHROMA_DATABASE,
                         api_key=settings.CHROMA_API_KEY,
                     )
+                    logger.info("Chroma Cloud client ready in %.2fs", time.perf_counter() - t)
     return _client
 
 
@@ -39,7 +43,16 @@ def get_collection(name: str = COLLECTION_NAME):
     if _collection is None:
         with _lock:
             if _collection is None:
-                _collection = get_chroma_client().get_or_create_collection(name=name)
+                logger.info("Opening/creating Chroma collection '%s'...", name)
+                t = time.perf_counter()
+                # embedding_function=None: we always supply precomputed Gemini
+                # embeddings, so Chroma must NOT load its default ONNX model
+                # (an ~80MB download that stalls on Render's cold/ephemeral disk).
+                _collection = get_chroma_client().get_or_create_collection(
+                    name=name,
+                    embedding_function=None,
+                )
+                logger.info("Chroma collection ready in %.2fs", time.perf_counter() - t)
     return _collection
 
 
@@ -58,12 +71,15 @@ def add_chunks_to_chroma(chunks: list[dict], embeddings: list[list[float]], coll
     ]
     documents = [chunk["text"] for chunk in chunks]
 
+    logger.info("collection.add: writing %d chunks...", len(ids))
+    t = time.perf_counter()
     collection.add(
         ids=ids,
         embeddings=embeddings,
         metadatas=metadatas,
         documents=documents,
     )
+    logger.info("collection.add finished in %.2fs", time.perf_counter() - t)
 
 
 @with_retry
